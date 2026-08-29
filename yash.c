@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <readline/readline.h>
+#include <errno.h>
 
 #define MAX_JOBS 20
 
@@ -102,16 +103,85 @@ void remove_job(struct job *job) {
     job->active = 0;
 }
 
+struct job *find_recent_stopped_job() {
+    struct job *recent = NULL;
+
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if(jobs[i].active == 0) {
+            continue;
+        }
+
+        if(jobs[i].active != STOPPED) {
+            continue;
+        }
+
+        if(recent == NULL || jobs[i].job_id > recent->job_id) {
+            recent = &jobs[i];
+        }
+    }
+
+    return recent;
+}
+
+struct job *find_recent_job() {
+    struct job *recent = NULL;
+
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if(jobs[i].active == 0) {
+            continue;
+        }
+
+        if (recent == NULL || jobs[i].job_id > recent->job_id) {
+            recent = &jobs[i];
+        }
+    }
+
+    return recent;
+}
+
+void add_pipeline_job(pid_t pid1, pid_t pid2, pid_t pgid, char *command) {
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if(jobs[i].active == 0) {
+            jobs[i].active = 1;
+            jobs[i].job_id = next_job_id;
+            next_job_id++;
+
+            jobs[i].pgid = pgid;
+
+            jobs[i].pid1 = pid1;
+            jobs[i].pid2 = pid2;
+
+            jobs[i].process_count = 2;
+            jobs[i].finished_count = 0;
+
+            jobs[i].state = RUNNING;
+
+            strcpy(jobs[i].command, command);
+
+            return;
+        }
+    }
+}
+
 int main () {
     char *input;
+
+    sigset_t child_mask;
+
+    sigemptyset(&child_mask);
+    sigaddset(&child_mask, SIGCHLD);
 
     struct sigaction sa;
 
     sa.sa_handler = handle_sigchld;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
+    sa.sa_flags = SA_RESTART;
 
     sigaction(SIGCHLD, &sa, NULL);
+
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
 
     while (1) {
         if (child_changed) {
@@ -120,7 +190,7 @@ int main () {
             int status;
             pid_t changed_pid;
 
-            while ((changed_pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            while ((changed_pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
                 struct job *job = find_job_by_pid(changed_pid);
 
                 if (job != NULL) {
@@ -130,8 +200,12 @@ int main () {
                         if (job->finished_count == job->process_count) {
                             remove_job(job);
                         }
+                    } else if (WIFSTOPPED(status)) {
+                    job->state = STOPPED;
+                    } else if (WIFCONTINUED(status)) {
+                    job->state = RUNNING;
                     }
-                }
+                }  
             }
         }
 
@@ -171,6 +245,144 @@ int main () {
             i--;
         }
 
+        int pipe_index = -1;
+
+        for (int j = 0; j < i; j++) {
+            if(strcmp(args[j], "|") == 0) {
+                pipe_index = j;
+                break;
+            }
+        }
+
+        if (pipe_index != -1) {
+            args[pipe_index] = NULL;
+
+            char **left_args = args;
+            char **right_args = &args[pipe_index + 1];
+
+            int pipefd[2];
+
+            if (pipe(pipefd) < 0) {
+                perror("pipe");
+                free(input);
+                continue;
+            }
+
+            sigset_t old_mask;
+
+            sigprocmask(SIG_BLOCK, &child_mask, &old_mask);
+
+            pid_t left_pid = fork();
+
+            if (left_pid < 0) {
+                perror("fork");
+                close(pipefd[0]);
+                close(pipefd[1]);
+
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+                free(input);
+                continue;
+            } else if (left_pid == 0) {
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+                setpgid(0, 0);
+
+                signal(SIGINT, SIG_DFL);
+                signal(SIGTSTP, SIG_DFL);
+                signal(SIGTTOU, SIG_DFL);
+
+                dup2(pipefd[1], STDOUT_FILENO);
+
+                close(pipefd[0]);
+                close(pipefd[1]);
+
+                execvp(left_args[0], left_args);
+
+                perror("execvp");
+                _exit(1);
+            } else {
+                setpgid(left_pid, left_pid);
+            }
+
+            pid_t right_pid = fork();
+
+            if(right_pid < 0) {
+                perror("fork");
+
+                close(pipefd[0]);
+                close(pipefd[1]);
+
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
+                
+                free(input);
+                continue;
+            } else if (right_pid == 0) {
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+                setpgid(0, left_pid);
+
+                signal(SIGINT, SIG_DFL);
+                signal(SIGTSTP, SIG_DFL);
+                signal(SIGTTOU, SIG_DFL);
+
+                dup2(pipefd[0], STDIN_FILENO);
+
+                close(pipefd[0]);
+                close(pipefd[1]);
+
+                execvp(right_args[0], right_args);
+
+                perror("execvp");
+                _exit(1);
+            } else {
+                setpgid(right_pid, left_pid);
+
+                close(pipefd[0]);
+                close(pipefd[1]);
+
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+                int status;
+                int finished = 0;
+                int stopped = 0;
+
+                tcsetpgrp(STDIN_FILENO, left_pid);
+
+                while (finished + stopped < 2) {
+                    pid_t changed_pid = waitpid(-left_pid, &status, WUNTRACED);
+
+                    if(changed_pid < 0) {
+                        break;
+                    }
+
+                    if(WIFEXITED(status) || WIFSIGNALED(status)) {
+                        finished++;
+                    } else if  (WIFSTOPPED(status)) {
+                        stopped++;
+                    }
+                }
+
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+
+                if (stopped > 0) {
+                    add_pipeline_job(left_pid, right_pid, left_pid, command);
+
+                    struct job *job = find_job_by_pid(left_pid);
+
+                    if (job != NULL) {
+                        job->state = STOPPED;
+                        job->finished_count = finished;
+                    }
+
+                    printf("\n");
+                } 
+
+                free(input);
+                continue;
+            }
+        }
+
         char *output_file = NULL;
         char *input_file = NULL;
         char *error_file = NULL;
@@ -202,9 +414,93 @@ int main () {
             continue;
         }
 
+        if(strcmp(args[0], "bg") == 0) {
+            struct job *job = find_recent_stopped_job();
+
+            if(job != NULL) {
+                kill(-job->pgid, SIGCONT);
+                job->state = RUNNING;
+
+                printf("[%d] Running %s\n", job->job_id, job->command);
+            }
+
+            free(input);
+            continue;
+        }
+
+        if(strcmp(args[0], "fg") == 0) {
+            struct job *job = find_recent_job();
+
+            if (job != NULL) {
+                int status;
+                int finished = job->finished_count;
+                int stopped = 0;
+
+                printf("%s\n", job->command);
+
+                tcsetpgrp(STDIN_FILENO, job->pgid);
+
+                if (job->state == STOPPED) {
+                    kill(-job->pgid, SIGCONT);
+                    job->state = RUNNING;
+                }
+
+                while (finished < job->process_count) {
+                    pid_t changed_pid = waitpid(-job->pgid, &status, WUNTRACED);
+
+                    if(changed_pid < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        perror("waitpid");
+                        break;
+                    }
+
+                    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                        finished++;
+                    } else if (WIFSTOPPED(status)) {
+                        stopped = 1;
+                        break;
+                    }
+                }
+
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+
+                if (stopped) {
+                    job->state = STOPPED;
+                    job->finished_count = finished;
+                    printf("\n");
+                } else {
+                    remove_job(job);
+
+                    if(WIFSIGNALED(status)) {
+                        printf("\n");
+                    }
+                }
+            }
+
+            free(input);
+            continue;
+        }
+
+        sigset_t old_mask;
+
+        sigprocmask(SIG_BLOCK, &child_mask, &old_mask);
+
         pid_t pid = fork();
 
-        if (pid == 0) {
+        if (pid < 0) {
+            perror("fork");
+            sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        }else if (pid == 0) {
+            sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+            setpgid(0, 0);
+
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
+
             if (output_file != NULL) {
                 int fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
@@ -246,11 +542,36 @@ int main () {
             perror("execvp");
             _exit(1);
         } else {
+            setpgid(pid, pid);
+
             if (background) {
                 add_job(pid, pid, command);
-                //print_jobs();
+                
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
             } else {
-                waitpid(pid, NULL, 0);
+                sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+                int status;
+
+                tcsetpgrp(STDIN_FILENO, pid);
+
+                waitpid(pid, &status, WUNTRACED);
+
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+
+                if(WIFSTOPPED(status)) {
+                    add_job(pid, pid, command);
+
+                    struct job *job = find_job_by_pid(pid);
+
+                    if(job != NULL) {
+                        job->state = STOPPED;
+                    }
+
+                    printf("\n");
+                }else if(WIFSIGNALED(status)) {
+                    printf("\n");
+                }
             }
         }
 
