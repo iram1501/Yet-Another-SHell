@@ -10,11 +10,11 @@
 #include <errno.h>
 
 #define MAX_JOBS 20
-#define MAX_ARGS 1001
 
 enum job_state {
     RUNNING,
-    STOPPED
+    STOPPED,
+    DONE
 };
 
 struct job {
@@ -35,22 +35,29 @@ struct job {
 
 struct job jobs[MAX_JOBS] = {0};
 
-int next_job_id = 1;
-
 volatile sig_atomic_t child_changed = 0;
 
 void handle_sigchld(int sig) {
-    (void)sig;
     child_changed = 1;
+}
+
+int get_next_job_id() {
+    int highest = 0;
+
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs[i].active && jobs[i].job_id > highest) {
+            highest = jobs[i].job_id;
+        }
+    }
+
+    return highest + 1;
 }
 
 void add_job(pid_t pid, pid_t pgid, char *command) {
     for (int i = 0; i < MAX_JOBS; i++) {
         if (jobs[i].active == 0) {
+            jobs[i].job_id = get_next_job_id();
             jobs[i].active = 1;
-
-            jobs[i].job_id = next_job_id;
-            next_job_id++;
 
             jobs[i].pgid = pgid;
 
@@ -69,13 +76,23 @@ void add_job(pid_t pid, pid_t pgid, char *command) {
     }
 }
 
+struct job *find_recent_job(void);
+
 void print_jobs() {
+    struct job *recent = find_recent_job();
+
     for (int i = 0; i < MAX_JOBS; i++) {
         if (jobs[i].active == 0) {
             continue;
         }
 
-        printf("[%d] ", jobs[i].job_id);
+        printf("[%d]", jobs[i].job_id);
+
+        if (recent == &jobs[i]) {
+            printf ("+ ");
+        } else {
+            printf("- ");
+        }
 
         if (jobs[i].state == RUNNING) {
             printf("Running ");
@@ -133,6 +150,10 @@ struct job *find_recent_job() {
             continue;
         }
 
+        if(jobs[i].state == DONE) {
+            continue;
+        }
+
         if (recent == NULL || jobs[i].job_id > recent->job_id) {
             recent = &jobs[i];
         }
@@ -144,9 +165,8 @@ struct job *find_recent_job() {
 void add_pipeline_job(pid_t pid1, pid_t pid2, pid_t pgid, char *command) {
     for (int i = 0; i < MAX_JOBS; i++) {
         if(jobs[i].active == 0) {
+            jobs[i].job_id = get_next_job_id();
             jobs[i].active = 1;
-            jobs[i].job_id = next_job_id;
-            next_job_id++;
 
             jobs[i].pgid = pgid;
 
@@ -165,52 +185,39 @@ void add_pipeline_job(pid_t pid1, pid_t pid2, pid_t pgid, char *command) {
     }
 }
 
-void parse_redirection(char **args, char **input_file, char **output_file, char **error_file) {
-	int read_index = 0;
-	int write_index = 0;
+void print_done_jobs() {
+    struct job *recent = NULL;
 
-	while (args[read_index] != NULL) {
-		if (strcmp(args[read_index], "<") == 0) {
-			*input_file = args[read_index + 1];
-			read_index += 2;
-		} else if (strcmp(args[read_index], ">") == 0) {
-			*output_file = args[read_index + 1];
-			read_index += 2;
-		} else if (strcmp(args[read_index], "2>") == 0) {
-			*error_file = args[read_index + 1];
-			read_index += 2;
-		} else {
-			args[write_index] = args[read_index];
-			write_index++;
-			read_index++;
-		}
-	}
-
-	args[write_index] = NULL;
-}
-
-void update_jobs() {
-    int status;
-    pid_t changed_pid;
-
-    child_changed = 0;
-
-    while((changed_pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
-        struct job *job = find_job_by_pid(changed_pid);
-
-        if (job != NULL) {
-            if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                job->finished_count++;
-
-                if(job->finished_count == job->process_count) {
-                    remove_job(job);
-                }
-            } else if (WIFSTOPPED(status)) {
-                job->state = STOPPED;
-            } else if (WIFCONTINUED(status)) {
-                job->state = RUNNING;
-            }
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs[i].active == 0) {
+            continue;
         }
+
+        if (recent == NULL || jobs[i].job_id > recent->job_id) {
+            recent = &jobs[i];
+        }
+    }
+
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs[i].active == 0) {
+            continue;
+        }
+
+        if (jobs[i].state != DONE) {
+            continue;
+        }
+
+        printf("[%d]", jobs[i].job_id);
+
+        if (recent == &jobs[i]) {
+            printf("+ ");
+        } else {
+            printf("- ");
+        }
+
+        printf("Done %s\n", jobs[i].command);
+
+        remove_job(&jobs[i]);
     }
 }
 
@@ -235,31 +242,43 @@ int main () {
     signal(SIGTTOU, SIG_IGN);
 
     while (1) {
-        input  = readline("# ");
-
         if (child_changed) {
             child_changed = 0;
-            update_jobs();
+
+            int status;
+            pid_t changed_pid;
+
+            while ((changed_pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+                struct job *job = find_job_by_pid(changed_pid);
+
+                if (job != NULL) {
+                    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                        job->finished_count++;
+
+                        if (job->finished_count == job->process_count) {
+                            job->state = DONE;
+                        }
+                    } else if (WIFSTOPPED(status)) {
+                    job->state = STOPPED;
+                    } else if (WIFCONTINUED(status)) {
+                    job->state = RUNNING;
+                    }
+                }  
+            }
         }
 
+        input  = readline("# ");
+
+        print_done_jobs();
+
         if (input == NULL) {
-            for (int i = 0; i < MAX_JOBS; i++) {
-                if (jobs[i].active) {
-                    kill(-jobs[i].pgid, SIGKILL);
-                }
-            }
-
-            while (waitpid(-1, NULL, 0) > 0){
-                
-            }
-
             break;
         }
 
         char command[2001];
         strcpy(command, input);
 
-        char *args[MAX_ARGS];
+        char *args[100];
         int i = 0;
 
         char *token = strtok(input, " ");
@@ -286,10 +305,6 @@ int main () {
             i--;
         }
 
-        char *output_file = NULL;
-        char *input_file = NULL;
-        char *error_file = NULL;
-
         int pipe_index = -1;
 
         for (int j = 0; j < i; j++) {
@@ -299,24 +314,11 @@ int main () {
             }
         }
 
-        if (pipe_index == -1) {
-            parse_redirection(args, &input_file, &output_file, &error_file);
-        } else if (pipe_index != -1) {
+        if (pipe_index != -1) {
             args[pipe_index] = NULL;
 
             char **left_args = args;
             char **right_args = &args[pipe_index + 1];
-
-            char *left_input = NULL;
-            char *left_output = NULL;
-            char *left_error = NULL;
-
-            char *right_input = NULL;
-            char *right_output = NULL;
-            char *right_error = NULL;
-
-            parse_redirection(left_args, &left_input, &left_output, &left_error);
-            parse_redirection(right_args, &right_input, &right_output, &right_error);
 
             int pipefd[2];
 
@@ -352,48 +354,12 @@ int main () {
 
                 dup2(pipefd[1], STDOUT_FILENO);
 
-                if(left_input != NULL) {
-                    int fd = open(left_input, O_RDONLY, 0644);
-
-                    if (fd < 0) {
-                        perror("open");
-                        _exit(1);
-                    }
-
-                    dup2(fd, STDIN_FILENO);
-                    close(fd);
-                }
-
-                if(left_output != NULL) {
-                    int fd = open(left_output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-                    if (fd < 0) {
-                        perror("open");
-                        _exit(1);
-                    }
-
-                    dup2(fd, STDOUT_FILENO);
-                    close(fd);
-                }
-
-                if(left_error != NULL) {
-                    int fd = open(left_error, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-                    if (fd < 0) {
-                        perror("open");
-                        _exit(1);
-                    }
-
-                    dup2(fd, STDERR_FILENO);
-                    close(fd);
-                }
-
                 close(pipefd[0]);
                 close(pipefd[1]);
 
                 execvp(left_args[0], left_args);
 
-                write(STDOUT_FILENO, "\n", 1);
+                perror("execvp");
                 _exit(1);
             } else {
                 setpgid(left_pid, left_pid);
@@ -406,9 +372,6 @@ int main () {
 
                 close(pipefd[0]);
                 close(pipefd[1]);
-
-                kill(-left_pid, SIGKILL);
-                waitpid(left_pid, NULL, 0);
 
                 sigprocmask(SIG_SETMASK, &old_mask, NULL);
                 
@@ -425,48 +388,12 @@ int main () {
 
                 dup2(pipefd[0], STDIN_FILENO);
 
-                if (right_input != NULL) {
-                    int fd = open(right_input, O_RDONLY);
-
-                    if (fd < 0) {
-                        perror("open");
-                        _exit(1);
-                    }
-
-                    dup2(fd, STDIN_FILENO);
-                    close(fd);
-                }
-
-                if (right_output != NULL) {
-                    int fd = open(right_output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-                    if (fd < 0) {
-                        perror("open");
-                        _exit(1);
-                    }
-
-                    dup2(fd, STDOUT_FILENO);
-                    close(fd);
-                }
-
-                if (right_error != NULL) {
-                    int fd = open(right_error, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-                    if (fd < 0) {
-                        perror("open");
-                        _exit(1);
-                    }
-
-                    dup2(fd, STDERR_FILENO);
-                    close(fd);
-                }
-
                 close(pipefd[0]);
                 close(pipefd[1]);
 
                 execvp(right_args[0], right_args);
 
-                write(STDOUT_FILENO, "\n", 1);
+                perror("execvp");
                 _exit(1);
             } else {
                 setpgid(right_pid, left_pid);
@@ -486,11 +413,6 @@ int main () {
                     pid_t changed_pid = waitpid(-left_pid, &status, WUNTRACED);
 
                     if(changed_pid < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-
-                        perror("waitpid");
                         break;
                     }
 
@@ -521,6 +443,30 @@ int main () {
             }
         }
 
+        char *output_file = NULL;
+        char *input_file = NULL;
+        char *error_file = NULL;
+
+        int write_index = 0;
+
+        for(int read_index = 0; read_index < i; read_index++) {
+            if (strcmp(args[read_index], "<") == 0) {
+                input_file = args[read_index + 1];
+                read_index++;
+            } else if (strcmp(args[read_index], ">") == 0) {
+                output_file = args[read_index + 1];
+                read_index++;
+            } else if (strcmp(args[read_index], "2>") == 0) {
+                error_file = args[read_index + 1];
+                read_index++;
+            } else {
+                args[write_index] = args[read_index];
+                write_index++;
+            }
+        }
+
+        args[write_index] = NULL;
+
         if(strcmp(args[0], "jobs") == 0) {
             print_jobs();
 
@@ -548,9 +494,7 @@ int main () {
             if (job != NULL) {
                 int status;
                 int finished = job->finished_count;
-                int stopped_count = 0;
-                int signaled = 0;
-                int wait_failed = 0;
+                int stopped = 0;
 
                 printf("%s\n", job->command);
 
@@ -561,39 +505,35 @@ int main () {
                     job->state = RUNNING;
                 }
 
-                while (finished + stopped_count < job->process_count) {
+                while (finished < job->process_count) {
                     pid_t changed_pid = waitpid(-job->pgid, &status, WUNTRACED);
 
                     if(changed_pid < 0) {
                         if (errno == EINTR) {
                             continue;
                         }
-
                         perror("waitpid");
-                        wait_failed = 1;
                         break;
                     }
 
-                    if (WIFEXITED(status)) {
+                    if (WIFEXITED(status) || WIFSIGNALED(status)) {
                         finished++;
-                    } else if (WIFSIGNALED(status)) {
-                        finished++;
-                        signaled = 1;
                     } else if (WIFSTOPPED(status)) {
-                        stopped_count++;
+                        stopped = 1;
+                        break;
                     }
                 }
 
                 tcsetpgrp(STDIN_FILENO, getpgrp());
 
-                if (stopped_count > 0) {
+                if (stopped) {
                     job->state = STOPPED;
                     job->finished_count = finished;
                     printf("\n");
-                } else if (!wait_failed) {
+                } else {
                     remove_job(job);
 
-                    if(signaled) {
+                    if(WIFSIGNALED(status)) {
                         printf("\n");
                     }
                 }
@@ -659,7 +599,7 @@ int main () {
 
             execvp(args[0], args);
 
-            write(STDOUT_FILENO, "\n", 1);
+            perror("execvp");
             _exit(1);
         } else {
             setpgid(pid, pid);
@@ -672,36 +612,25 @@ int main () {
                 sigprocmask(SIG_SETMASK, &old_mask, NULL);
 
                 int status;
-                int wait_failed = 0;
 
                 tcsetpgrp(STDIN_FILENO, pid);
 
-                while (waitpid(pid, &status, WUNTRACED) < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-
-                    perror("waitpid");
-                    wait_failed = 1;
-                    break;
-                }
+                waitpid(pid, &status, WUNTRACED);
 
                 tcsetpgrp(STDIN_FILENO, getpgrp());
 
-                if(!wait_failed){
-                    if(WIFSTOPPED(status)) {
-                        add_job(pid, pid, command);
+                if(WIFSTOPPED(status)) {
+                    add_job(pid, pid, command);
 
-                        struct job *job = find_job_by_pid(pid);
+                    struct job *job = find_job_by_pid(pid);
 
-                        if(job != NULL) {
-                            job->state = STOPPED;
-                        }
-
-                        printf("\n");
-                    } else if(WIFSIGNALED(status)) {
-                        printf("\n");
+                    if(job != NULL) {
+                        job->state = STOPPED;
                     }
+
+                    printf("\n");
+                }else if(WIFSIGNALED(status)) {
+                    printf("\n");
                 }
             }
         }
