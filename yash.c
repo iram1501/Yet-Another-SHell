@@ -481,7 +481,13 @@ int main () {
                 kill(-job->pgid, SIGCONT);
                 job->state = RUNNING;
 
-                printf("[%d] Running %s\n", job->job_id, job->command);
+                size_t len = strlen(job->command);
+
+                if (len == 0 || job->command[len - 1] != '&') {
+                    strcat(job->command, " &");
+                }
+
+                printf("[%d]+ Running %s\n", job->job_id, job->command);
             }
 
             free(input);
@@ -516,8 +522,14 @@ int main () {
                         break;
                     }
 
-                    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    if (WIFEXITED(status)) {
                         finished++;
+                    } else if (WIFSIGNALED(status)) {
+                        finished++;
+
+                        if (WTERMSIG(status) == SIGINT) {
+                            printf("^C\n");
+                        }
                     } else if (WIFSTOPPED(status)) {
                         stopped = 1;
                         break;
@@ -532,10 +544,6 @@ int main () {
                     printf("\n");
                 } else {
                     remove_job(job);
-
-                    if(WIFSIGNALED(status)) {
-                        printf("\n");
-                    }
                 }
             }
 
@@ -630,7 +638,9 @@ int main () {
 
                     printf("\n");
                 }else if(WIFSIGNALED(status)) {
-                    printf("\n");
+                    if (WTERMSIG(status) == SIGINT){
+                        printf("^C\n");
+                    }
                 }
             }
         }
